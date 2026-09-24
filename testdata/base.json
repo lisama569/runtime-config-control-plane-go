@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "properties": {
+    "service.name": {"type": "string", "value": "rccp"},
+    "service.timeout_ms": {"type": "int", "value": 1500},
+    "service.sample_rate": {"type": "float", "value": 0.25},
+    "feature.dark_mode_default": {"type": "bool", "value": false},
+    "db.password": {"type": "sensitive", "value": "s3cr3t"}
+  },
+  "features": {
+    "new_checkout": {"enabled": true, "percentage": 50, "allow_list": ["qa", "beta-user"]},
+    "legacy_ui": {"enabled": true, "percentage": 0}
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "properties": {
+    "service.timeout_ms": {"type": "int", "value": 3000}
+  },
+  "features": {
+    "new_checkout": {"enabled": true, "percentage": 10}
+  }
+}
