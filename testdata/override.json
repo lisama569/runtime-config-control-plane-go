@@ -1,0 +1,8 @@
+{
+  "flags": [
+    {"name": "checkout_v2", "enabled": false, "rollout": {"percentage": 100}}
+  ],
+  "settings": [
+    {"key": "greeting", "setting": {"value": "hola", "type": "string"}}
+  ]
+}

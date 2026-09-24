@@ -1,0 +1,5 @@
+{
+  "flags": [
+    {"name": "bad_flag", "rollout": {"percentage": 150}}
+  ]
+}

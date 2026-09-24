@@ -1,0 +1,10 @@
+{
+  "flags": [
+    {"name": "checkout_v2", "enabled": true, "description": "new checkout", "rollout": {"percentage": 25}},
+    {"name": "beta_only", "enabled": true, "rollout": {"percentage": 0, "allow_list": ["beta-user"]}}
+  ],
+  "settings": [
+    {"key": "greeting", "setting": {"value": "hello", "type": "string"}},
+    {"key": "db_password", "secret": true, "setting": {"value": "s3cr3t", "type": "string"}}
+  ]
+}
