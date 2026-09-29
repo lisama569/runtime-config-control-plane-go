@@ -17,6 +17,13 @@ const (
 	KindTypeMismatch   Kind = "TYPE_MISMATCH"
 	KindMissingValue   Kind = "MISSING_VALUE"
 	KindRollbackFailed Kind = "ROLLBACK_FAILED"
+	// Persistence failures. These kinds are deliberately distinct so operators
+	// can tell corruption, truncated writes and capacity problems apart.
+	KindPersistCorrupt  Kind = "PERSIST_CORRUPT"   // persisted bytes unparseable / structural mismatch
+	KindPersistChecksum Kind = "PERSIST_CHECKSUM"  // CRC32 mismatch: torn or altered write
+	KindPersistIO       Kind = "PERSIST_IO"        // underlying filesystem failure
+	KindPersistTooLarge Kind = "PERSIST_TOO_LARGE" // payload exceeds the configured capacity cap
+	KindPersistSchema   Kind = "PERSIST_SCHEMA"    // unsupported/unknown on-disk format version
 )
 
 // Error is a classified error carrying a stable Kind.

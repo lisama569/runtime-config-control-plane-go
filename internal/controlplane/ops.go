@@ -84,12 +84,19 @@ func (p *Plane) ApplyPatch(ctx context.Context, actor string, req PatchRequest) 
 	if err != nil {
 		return from, 0, err
 	}
+	// Stage the override state for the version we are about to publish so the
+	// durability hook (run inside the store's commit) can persist it before
+	// the new snapshot becomes visible.
+	newVersion := cur.Version + 1
+	p.stagePending(newVersion, next)
 	snap, cerr := p.store.CAS(ctx, cur.Version, res.Doc, store.Change{
 		Reason: "api-patch", Actor: actor,
 		Origin: res.PropertyOrigin, Features: res.FeatureOrigin,
 	})
+	p.clearPending(newVersion)
 	if cerr != nil {
-		// Lost the race: revert in-memory override and demand client retry.
+		// Lost the race (or durability failed): revert in-memory override and
+		// demand client retry. Nothing was published or made durable.
 		p.mu.Lock()
 		if prev, ok := p.overHist[cur.Version]; ok {
 			p.over = prev
@@ -102,10 +109,8 @@ func (p *Plane) ApplyPatch(ctx context.Context, actor string, req PatchRequest) 
 		})
 		return from, 0, cerr
 	}
-	p.mu.Lock()
-	p.overHist[snap.Version] = next
-	p.trimOverHist()
-	p.mu.Unlock()
+	// Override history for snap.Version was already committed inside the
+	// store's durability hook (atomically with persistence).
 	_, _ = p.aud.Record(ctx, audit.Entry{
 		Actor: actor, Action: string(actWrite), Target: "config",
 		Result:  audit.ResultAllowed,
@@ -133,6 +138,9 @@ func (p *Plane) Rollback(ctx context.Context, actor string, targetVersion int64)
 	}
 	p.mu.Lock()
 	ov, known := p.overHist[targetVersion]
+	// Remember the current override so a failed/durability-aborted rollback
+	// restores in-memory state to match the unchanged live snapshot.
+	curOv, curKnown := p.overHist[cur.Version]
 	if known {
 		p.over = ov.clone()
 	} else {
@@ -142,8 +150,16 @@ func (p *Plane) Rollback(ctx context.Context, actor string, targetVersion int64)
 	}
 	p.mu.Unlock()
 
+	newVersion := cur.Version + 1
+	p.stagePending(newVersion, ov)
 	snap, cerr := p.store.Rollback(ctx, targetVersion, actor)
+	p.clearPending(newVersion)
 	if cerr != nil {
+		if curKnown {
+			p.mu.Lock()
+			p.over = curOv.clone()
+			p.mu.Unlock()
+		}
 		_, _ = p.aud.Record(ctx, audit.Entry{
 			Actor: actor, Action: string(actRollback), Target: itoa(targetVersion),
 			Result: audit.ResultError, Reason: cerr.Error(),
@@ -151,10 +167,7 @@ func (p *Plane) Rollback(ctx context.Context, actor string, targetVersion int64)
 		})
 		return from, 0, cerr
 	}
-	p.mu.Lock()
-	p.overHist[snap.Version] = ov.clone()
-	p.trimOverHist()
-	p.mu.Unlock()
+	// Override history for the new version was committed in the hook.
 	_, _ = p.aud.Record(ctx, audit.Entry{
 		Actor: actor, Action: string(actRollback), Target: itoa(targetVersion),
 		Result:  audit.ResultAllowed,

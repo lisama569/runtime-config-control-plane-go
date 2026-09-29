@@ -7,11 +7,12 @@ cmd/rccp                  本地 HTTP 服务入口（只做装配与参数解析
 internal/source           本地来源（JSON 文件）、内容版本化、热更新轮询
 internal/config           规范化模型、全量校验、编解码、快照类型化访问
 internal/merge            多来源分层合并 + 来源可追溯（origin）
-internal/store            原子快照指针、线性版本历史、CAS、回滚
+internal/store            原子快照指针、线性版本历史、CAS、回滚、提交前持久化钩子
 internal/flag             稳定主体哈希分桶与功能开关判定
 internal/auth             令牌认证与读写分离的 RBAC
-internal/audit            只追加审计日志（含拒绝事件）
-internal/controlplane     装配以上模块：热更新重合并、API 覆盖层、HTTP API
+internal/audit            只追加审计日志（含拒绝事件）、重启回放、可挂持久化 sink
+internal/persist          崩溃安全的磁盘持久化：CRC 校验、原子写、备份与审计日志
+internal/controlplane     装配以上模块：热更新重合并、API 覆盖层、HTTP API、恢复
 internal/errs             稳定的错误分类
 ```
 
@@ -90,17 +91,109 @@ internal/errs             稳定的错误分类
 动作/目标/结果（allowed|denied|error）/from/to 版本/错误分类/原因。
 `List()` 返回防御性副本。
 
-## 7. 测试矩阵
+## 7. 持久化与重启恢复（`-persist-dir`）
+
+不传 `-persist-dir` 时行为与原来**完全一致**（纯内存）。传入一个数据目录后，
+生效配置时间线与审计流水落到磁盘，进程重启后自动恢复。持久化是可选叠加层，
+对外的读写权限、脱敏、错误分类、灰度规则、CAS 冲突语义都不改变。
+
+### 7.1 磁盘布局
+
+数据目录权限 `0700`，其中文件权限 `0600`（持久化内容包含敏感值原值，仅属主可读写）：
+
+| 文件 | 内容 | 写方式 |
+| --- | --- | --- |
+| `state.json` | 最后一次完整状态：当前生效快照、保留窗口内全部历史快照、每个版本的 `api-override` 状态（含墓碑） | 临时文件 + fsync + 原子 rename |
+| `state.json.bak` | 上一次完整状态，作为主文件损坏时的回退 | 主文件安装前由旧主文件 rename 而来 |
+| `audit.log` | 只追加的分帧审计日志（长度 + JSON 载荷 + CRC32） | O_APPEND 逐帧追加并 fsync |
+
+`state.json` 外层是 `{format, crc32, data}` 信封，`crc32`（IEEE，十六进制）
+覆盖 `data` 的**确切字节**，恢复时先校验 CRC 再解析。`data` 内为带 `schema`
+版本号的状态结构。**整状态原子快照**（不是增量日志）：任意时刻磁盘上的状态
+要么是上一份完整状态、要么是新一份完整状态，不存在“半个新版本”。
+
+### 7.2 恢复规则（恢复完成前不对外服务）
+
+启动时在 `controlplane.New` 内、任何 HTTP/goroutine 服务开始之前完成恢复：
+
+1. `state.json` 存在且 CRC/结构合法 → 使用它；
+2. 主文件损坏（坏 JSON / CRC 不符 / 结构不一致）但 `state.json.bak` 完整
+   → **回退到最后一次完整可用的提交**，并在日志中按分类记录主文件问题，
+   随后立即重写一份干净的主文件（自愈）；
+3. 主文件缺失但备份在（rename 安装前被杀）→ 同样用备份恢复；
+4. 两者都损坏/无法解析 → **启动失败、fail-closed**，绝不以损坏或中间状态对外服务；
+5. 空目录 → 像以前一样从文件来源合并出 v1，并在对外服务前先把 v1 落盘；落盘失败同样中止启动。
+
+- 审计日志按帧回放：遇到第一个损坏/截断帧（被 kill 时写了一半的尾部）即停，
+  保留其前面的**完整前缀**，把损坏尾物理截断，并在恢复报告/日志中分类说明。
+- 恢复出的 store 直接以磁盘时间线重建，后续版本号从“当前版本 + 1”继续：
+  **不回退、不重复、也不复用已发布过的版本号**；回滚也照常产生全新线性版本。
+- 每个持久化版本都带当时的 `api-override`（含墓碑）与属性版本号，因此恢复后的
+  生效配置、origin、灰度判定、可回滚窗口与重启前**逐字一致**。
+
+### 7.3 “被拒绝/未授权的请求不会在重启后复活”
+
+只有**已提交生效**的状态进入 `state.json`。持久化在 store 的串行提交区内、
+快照对读者可见**之前**同步完成（durability precedes visibility）：
+
+- 持久化成功 → 才发布原子快照；客户端一旦观察到某版本，该版本必已落盘；
+- 持久化失败（磁盘错误/超容量）→ 提交整体中止，内存与磁盘都不变，
+  对客户端返回分类错误（`500 PERSIST_IO/PERSIST_CORRUPT/...` 或
+  `507 PERSIST_TOO_LARGE`），客户端按 STALE 之外的错误处理，可安全重试；
+- 因此写到一半被 kill，只会让“那次未完成的提交”整体缺席，恢复到它之前最后
+  一次完整状态；被 401/403 挡下或 409 冲突拒绝的请求从来没有进入状态文件，
+  重启不可能把它们“变成生效”。拒绝事件本身仍在 `audit.log` 中保留（可审计），
+  但不会改变任何配置。
+
+### 7.4 容量上限与裁剪（磁盘占用可控）
+
+`persist.Limits`（默认值，可用 `Options.PersistLimits` 覆盖）：
+
+| 限制 | 默认 | 触顶行为 |
+| --- | --- | --- |
+| `RetainVersions` | 100 | 状态只保留最新 100 个版本（含当前），override 数据同步裁剪 |
+| `MaxStateBytes` | 16 MiB | 超过则拒绝本次提交（`PERSIST_TOO_LARGE`），不替换磁盘状态 |
+| `MaxAuditEntries` | 10000 | 追加前压缩审计日志，保留最新 10000 条 |
+| `MaxAuditBytes` | 16 MiB | 超过则进一步按字节收缩到放得下的最新窗口 |
+| 单条审计帧 | 1 MiB | 超过则拒绝该帧（仅审计写入失败，不影响配置提交） |
+
+状态裁剪窗口与内存 `store` 的历史窗口（默认也是 100）一致：磁盘与内存保留的
+版本集合相同，裁剪后“能回滚到哪些版本”在重启前后保持自洽。目标版本已不在
+窗口内时，回滚仍返回 `404 ROLLBACK_FAILED`，语义不变。审计日志是只增的合规
+流水，因此独立保留更大的窗口（默认一万条）；其裁剪只影响可回看的审计范围，
+不影响配置与回滚。
+
+> 说明：历史窗口默认始终保留“当前 + 最近若干版本”。与既有实现一致，连续提交
+> 超过窗口后最老版本（含最初的 v1）会被挤出；这是裁剪的既定语义，文档与代码一致。
+
+### 7.5 稳定的新增错误分类
+
+| Kind | 含义 |
+| --- | --- |
+| `PERSIST_CORRUPT` | 持久化内容无法解析或结构不一致（历史不递增、缺 override 等） |
+| `PERSIST_CHECKSUM` | CRC32 不符：撕裂写或内容被改动 |
+| `PERSIST_IO` | 文件系统读写/fsync/rename 失败 |
+| `PERSIST_TOO_LARGE` | 状态或审计帧超过容量上限 |
+| `PERSIST_SCHEMA` | 遇到不支持的磁盘格式/schema 版本 |
+
+这些分类只用于持久化失败路径，既有 `VALIDATION/.../STALE_VERSION/ROLLBACK_FAILED`
+分类与 HTTP 状态码映射保持不变。
+
+## 8. 测试矩阵
 
 | 文件 | 覆盖点 |
 | --- | --- |
 | `internal/config/config_test.go` | 缺失值/null/类型不兼容/非法类型/越界百分比，分类可区分；脱敏编解码 |
 | `internal/merge/merge_test.go` | 优先级稳定（50 次合并）、origin、来源版本、非法层拒绝 |
 | `internal/store/store_test.go` | CAS 过期拒绝、50 并发写无丢失、回滚完整恢复、并发读者无撕裂读 |
+| `internal/store/hook_test.go` | 提交前持久化钩子失败时提交整体中止（不发布、不占版本）；钩子看到裁剪后的完整时间线；恢复式构造后续线性递增 |
 | `internal/source/file_test.go` | 非法热更新不升版本、合法更新升一次、文件缺失、watcher 只放行合法更新 |
 | `internal/flag/flag_test.go` | 判定稳定、0/100 边界、白名单与关闭优先级、分布均匀、特性独立打散 |
 | `internal/auth/auth_test.go` | 三角色权限矩阵、401 与 403 分类分离 |
 | `internal/audit/audit_test.go` | 单调序号、只追加、副本隔离 |
+| `internal/audit/sink_test.go` | 重启回放后续号继续、sink 收到新条目、sink 失败不影响被审计操作 |
+| `internal/persist/persist_test.go` | 往返恢复（含密钥/origin/override）、连续多次重启版本单调、坏主文件回退备份、CRC 篡改双损坏 fail-closed、撕裂临时文件保留最后完整态、超容量拒绝不落盘、裁剪窗口自洽、审计撕裂尾截断与压缩 |
 | `internal/controlplane/controlplane_test.go` | 热更新回退、过期冲突、非法补丁全拒、未授权不改状态、端到端回滚、8 读者×100 写无撕裂、脱敏与灰度边界 |
+| `internal/controlplane/persist_e2e_test.go` | 重启恢复生效配置/灰度/版本时间线、连续多轮重启、裁剪窗口下回滚一致、拒绝/未授权不复活且审计留存、损坏回退后自愈、裁剪后恢复一致、8×15 并发写持久化不变量与重启核对 |
 
 所有测试在 `go test -race` 下通过。

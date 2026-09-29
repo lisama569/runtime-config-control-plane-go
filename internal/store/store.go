@@ -20,6 +20,16 @@ type Change struct {
 	Features map[string]string
 }
 
+// BeforeCommit is invoked INSIDE the store's serialized write section with
+// the candidate snapshot already chosen but not yet visible to any reader.
+// history is the full retained timeline as it will stand after commit
+// (oldest first, including next). A non-nil error aborts the commit
+// atomically: no snapshot is published and history is untouched. This is the
+// durability hook: an implementation synchronously makes the new state
+// durable, so durability always precedes visibility (a kill can never lose a
+// commit a client observed, and a half-durable commit can never become live).
+type BeforeCommit func(ctx context.Context, next *config.Snapshot, history []*config.Snapshot) error
+
 // Store provides atomic, wait-free reads and serialized updates.
 type Store interface {
 	Current() *config.Snapshot
@@ -41,12 +51,37 @@ type memoryStore struct {
 	current atomic.Pointer[config.Snapshot]
 	mu      sync.Mutex
 	history []*config.Snapshot // including current, oldest first
+	hook    BeforeCommit
 }
 
 // NewMemory wraps an already-built initial snapshot.
 func NewMemory(initial *config.Snapshot) Store {
-	s := &memoryStore{history: []*config.Snapshot{initial}}
+	return NewMemoryWithHook(initial, nil)
+}
+
+// NewMemoryWithHook wraps an initial snapshot and installs a pre-commit hook.
+func NewMemoryWithHook(initial *config.Snapshot, hook BeforeCommit) Store {
+	if initial == nil {
+		panic("store: initial snapshot must not be nil")
+	}
+	s := &memoryStore{history: []*config.Snapshot{initial}, hook: hook}
 	s.current.Store(initial)
+	return s
+}
+
+// NewRestored rebuilds a store from a durable timeline. The history slice is
+// assumed already validated/ordered (oldest first); the newest entry becomes
+// the live snapshot and subsequent commits continue from its version, so
+// version numbers never regress or repeat after a restart.
+func NewRestored(history []*config.Snapshot, hook BeforeCommit) Store {
+	if len(history) == 0 {
+		panic("store: restored history must not be empty")
+	}
+	s := &memoryStore{
+		history: append([]*config.Snapshot(nil), history...),
+		hook:    hook,
+	}
+	s.current.Store(history[len(history)-1])
 	return s
 }
 
@@ -75,6 +110,9 @@ func (s *memoryStore) CAS(ctx context.Context, expected int64, doc *config.Docum
 		FeatureOrigin:  cloneOrigin(ch.Features),
 		SourceVersions: cloneVersions(cur.SourceVersions),
 		CreatedAtUnix:  time.Now().Unix(),
+	}
+	if err := s.runHook(ctx, snap); err != nil {
+		return nil, err
 	}
 	s.commit(snap)
 	return snap, nil
@@ -109,8 +147,25 @@ func (s *memoryStore) Rollback(ctx context.Context, targetVersion int64, actor s
 		CreatedAtUnix:  time.Now().Unix(),
 	}
 	_ = actor // actor is recorded by the audit layer at the caller
+	if err := s.runHook(ctx, snap); err != nil {
+		return nil, err
+	}
 	s.commit(snap)
 	return snap, nil
+}
+
+// runHook invokes the durability hook with the timeline as it will stand
+// after committing snap (trimmed exactly as commit() will keep it). The hook
+// therefore persists precisely what is retained in memory.
+func (s *memoryStore) runHook(ctx context.Context, snap *config.Snapshot) error {
+	if s.hook == nil {
+		return nil
+	}
+	hist := append(append([]*config.Snapshot(nil), s.history...), snap)
+	if len(hist) > maxHistory {
+		hist = hist[len(hist)-maxHistory:]
+	}
+	return s.hook(ctx, snap, hist)
 }
 
 func (s *memoryStore) commit(snap *config.Snapshot) {

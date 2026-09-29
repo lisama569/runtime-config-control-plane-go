@@ -13,6 +13,7 @@ import (
 	"github.com/lisama569/runtime-config-control-plane-go/internal/config"
 	"github.com/lisama569/runtime-config-control-plane-go/internal/flag"
 	"github.com/lisama569/runtime-config-control-plane-go/internal/merge"
+	"github.com/lisama569/runtime-config-control-plane-go/internal/persist"
 	"github.com/lisama569/runtime-config-control-plane-go/internal/source"
 	"github.com/lisama569/runtime-config-control-plane-go/internal/store"
 )
@@ -22,6 +23,21 @@ type Options struct {
 	Sources      []source.Source
 	Tokens       map[string]auth.Principal
 	PollInterval time.Duration
+	// PersistDir enables crash-safe durability when non-empty: the effective
+	// timeline and audit trail are kept in this directory and recovered on
+	// startup. Empty keeps the original in-memory-only behavior.
+	PersistDir string
+	// PersistLimits overrides the default on-disk capacity bounds. The zero
+	// value means defaults.
+	PersistLimits persist.Limits
+	// PersistLogger receives recovery information and durability errors. When
+	// nil the standard library default logger is used.
+	PersistLogger persistLogger
+}
+
+// persistLogger is the tiny logging surface used for durability events.
+type persistLogger interface {
+	Printf(format string, args ...any)
 }
 
 // Plane is the assembled control plane.
@@ -32,13 +48,17 @@ type Plane struct {
 	aud     *audit.Logger
 	sources []source.Source
 
+	persist    *persist.Store // nil when persistence is disabled
+	persistLog persistLogger
+
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mu       sync.Mutex
-	layers   map[string]sourceDoc // latest accepted doc per source
-	over     overrideState
-	overHist map[int64]overrideState // override state per effective version
+	mu          sync.Mutex
+	layers      map[string]sourceDoc // latest accepted doc per source
+	over        overrideState
+	overHist    map[int64]overrideState // override state per effective version
+	pendingOver map[int64]overrideState // staged for the in-flight durable commit
 }
 
 type sourceDoc struct {
@@ -105,6 +125,11 @@ func (o overrideState) emptyDoc() *config.Document {
 // New loads all sources, merges them and constructs the plane.
 // It fails closed: any source that cannot be loaded validly at startup
 // aborts construction instead of starting with partial state.
+//
+// When Options.PersistDir is set, the last durable timeline is recovered
+// BEFORE the plane can serve anything. Requests rejected or unauthorized in a
+// previous process are never replayed (only complete committed states are
+// durable), so a restart cannot resurrect a write that had not taken effect.
 func New(ctx context.Context, opts Options) (*Plane, error) {
 	if len(opts.Sources) == 0 {
 		return nil, errValidation("controlplane: at least one source is required")
@@ -118,14 +143,20 @@ func New(ctx context.Context, opts Options) (*Plane, error) {
 	})
 
 	p := &Plane{
-		eval:     flag.NewEvaluator(),
-		authz:    auth.NewAuthorizer(opts.Tokens),
-		aud:      audit.NewLogger(),
-		sources:  sorted,
-		layers:   map[string]sourceDoc{},
-		over:     newOverrideState(),
-		overHist: map[int64]overrideState{},
+		eval:        flag.NewEvaluator(),
+		authz:       auth.NewAuthorizer(opts.Tokens),
+		aud:         audit.NewLogger(),
+		sources:     sorted,
+		layers:      map[string]sourceDoc{},
+		over:        newOverrideState(),
+		overHist:    map[int64]overrideState{},
+		pendingOver: map[int64]overrideState{},
+		persistLog:  opts.PersistLogger,
 	}
+
+	// Sources still load at startup: failure to read any source fails closed,
+	// exactly as without persistence. Their current content is also captured
+	// in layers so a later hot reload can merge against the restored config.
 	for _, src := range sorted {
 		doc, ver, err := src.Load(ctx)
 		if err != nil {
@@ -133,20 +164,56 @@ func New(ctx context.Context, opts Options) (*Plane, error) {
 		}
 		p.layers[src.Name()] = sourceDoc{src: src, doc: doc, ver: ver}
 	}
-	res, err := p.remerge()
-	if err != nil {
-		return nil, err
+
+	var restored *persist.State
+	var seedAudit []audit.Entry
+	if opts.PersistDir != "" {
+		ps, rep, st, err := persist.Open(ctx, opts.PersistDir, opts.PersistLimits)
+		if err != nil {
+			return nil, err // corrupted with no usable backup: fail closed
+		}
+		p.persist = ps
+		p.logRecovery(rep)
+		if rep.Loaded {
+			restored = st
+		}
+		// persist.Open already replayed the journal (and truncated any torn
+		// tail); grab the in-memory replay once and seed the audit logger so
+		// sequence numbers continue past it and the trail survives restart.
+		seedAudit = ps.AuditEntries()
+		p.aud = audit.NewLoggerWithSeed(seedAudit)
 	}
-	snap := &config.Snapshot{
-		Version:        1,
-		Doc:            res.Doc,
-		PropertyOrigin: res.PropertyOrigin,
-		FeatureOrigin:  res.FeatureOrigin,
-		SourceVersions: res.SourceVersions,
-		CreatedAtUnix:  time.Now().Unix(),
+
+	if restored != nil {
+		if err := p.applyRestored(restored); err != nil {
+			return nil, err
+		}
+	} else {
+		snap, err := p.bootstrapFromSourcesLocked()
+		if err != nil {
+			return nil, err
+		}
+		p.overHist[1] = p.over.clone()
+		var hook store.BeforeCommit
+		if p.persist != nil {
+			hook = p.persistHook()
+		}
+		p.store = store.NewMemoryWithHook(snap, hook)
+		if p.persist != nil {
+			// Make the initial bootstrap durable BEFORE serving. Failure here
+			// aborts startup (fail closed) rather than serving non-durable v1.
+			p.stagePending(snap.Version, p.overHist[1])
+			if err := p.saveDurable(ctx, snap, []*config.Snapshot{snap}); err != nil {
+				return nil, err
+			}
+		}
 	}
-	p.store = store.NewMemory(snap)
-	p.overHist[1] = p.over.clone()
+
+	if p.persist != nil {
+		p.aud.AttachSink(auditSinkAdapter{ps: p.persist}, func(err error) {
+			p.plog().Printf("persist: audit durability failure (request unaffected): %v", err)
+		})
+	}
 
 	rctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
@@ -155,6 +222,89 @@ func New(ctx context.Context, opts Options) (*Plane, error) {
 	go p.reloadLoop(rctx, w, &p.wg)
 	go func() { defer p.wg.Done(); _ = w.Run(rctx, p.eventCh(rctx)) }()
 	return p, nil
+}
+
+// stagePending records the override state for the version a commit is about
+// to publish, so the durability hook can persist it inside the store section.
+func (p *Plane) stagePending(v int64, ov overrideState) {
+	p.mu.Lock()
+	p.pendingOver[v] = ov.clone()
+	p.mu.Unlock()
+}
+
+// clearPending drops the staged entry after a finished/failed commit.
+func (p *Plane) clearPending(v int64) {
+	p.mu.Lock()
+	delete(p.pendingOver, v)
+	p.mu.Unlock()
+}
+
+// saveDurable assembles the persist.State for snap + retained history and
+// writes it through the durability backend. It runs inside the store's
+// serialized commit (holding p.mu), so committing the new override-history
+// entry here makes it visible to every later commit's durability write even
+// when two clients race: a later hook can never observe a missing entry.
+func (p *Plane) saveDurable(ctx context.Context, snap *config.Snapshot, history []*config.Snapshot) error {
+	if p.persist == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if ov, ok := p.pendingOver[snap.Version]; ok {
+		// Commit the staged override state into the timeline atomically with
+		// durability, then release the staging slot.
+		p.overHist[snap.Version] = ov
+		p.trimOverHist()
+		delete(p.pendingOver, snap.Version)
+	}
+	st := &persist.State{
+		Current:   snap,
+		History:   history,
+		Overrides: map[int64]persist.Override{},
+	}
+	for _, h := range history {
+		hov, known := p.overHist[h.Version]
+		if !known {
+			return persistStateErr(h.Version)
+		}
+		st.Overrides[h.Version] = toPersistOverride(hov)
+	}
+	return p.persist.SaveState(ctx, st)
+}
+
+// applyRestored rebuilds in-memory store and override timeline from a durable
+// state. Recovery is complete before New returns, so no request can observe a
+// partially reconstructed plane. The audit logger was already seeded from the
+// replayed journal before this runs.
+func (p *Plane) applyRestored(st *persist.State) error {
+	overHist := map[int64]overrideState{}
+	for v, ov := range st.Overrides {
+		overHist[v] = fromPersistOverride(ov)
+	}
+	curOv, ok := overHist[st.Current.Version]
+	if !ok {
+		return persistStateErr(st.Current.Version)
+	}
+	p.over = curOv.clone()
+	p.overHist = overHist
+	p.store = store.NewRestored(st.History, p.persistHook())
+	return nil
+}
+
+// bootstrapFromSourcesLocked merges current sources with an empty override.
+func (p *Plane) bootstrapFromSourcesLocked() (*config.Snapshot, error) {
+	res, err := p.remerge()
+	if err != nil {
+		return nil, err
+	}
+	return &config.Snapshot{
+		Version:        1,
+		Doc:            res.Doc,
+		PropertyOrigin: res.PropertyOrigin,
+		FeatureOrigin:  res.FeatureOrigin,
+		SourceVersions: res.SourceVersions,
+		CreatedAtUnix:  nowFn(),
+	}, nil
 }
 
 func (p *Plane) eventCh(ctx context.Context) chan source.UpdateEvent {
@@ -219,17 +369,16 @@ func (p *Plane) applySourceEvent(ctx context.Context, ev source.UpdateEvent) {
 			})
 			return
 		}
+		p.stagePending(cur.Version+1, p.over)
 		snap, cerr := p.store.CAS(ctx, cur.Version, res.Doc, store.Change{
 			Reason:   "hot-reload:" + ev.Source.Name(),
 			Actor:    "system",
 			Origin:   res.PropertyOrigin,
 			Features: res.FeatureOrigin,
 		})
+		p.clearPending(cur.Version + 1)
 		if cerr == nil {
-			p.mu.Lock()
-			p.overHist[snap.Version] = p.over.clone()
-			p.trimOverHist()
-			p.mu.Unlock()
+			// Override history committed inside the durability hook.
 			_, _ = p.aud.Record(ctx, audit.Entry{
 				Actor: "system", Action: "source:reload", Target: ev.Source.Name(),
 				Result:  audit.ResultAllowed,

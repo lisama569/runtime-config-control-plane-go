@@ -221,6 +221,13 @@ func writeKindError(w http.ResponseWriter, version int64, err error) {
 		status = http.StatusForbidden
 	case errs.KindUnauthorized:
 		status = http.StatusUnauthorized
+	case errs.KindPersistTooLarge:
+		// Capacity ceiling: the caller can act (trim/raise the cap), so 507.
+		status = http.StatusInsufficientStorage
+	case errs.KindPersistCorrupt, errs.KindPersistChecksum,
+		errs.KindPersistIO, errs.KindPersistSchema:
+		// Durability failure: the commit was aborted and nothing changed.
+		status = http.StatusInternalServerError
 	}
 	writeError(w, status, version, err)
 }
