@@ -221,6 +221,9 @@ func writeKindError(w http.ResponseWriter, version int64, err error) {
 		status = http.StatusForbidden
 	case errs.KindUnauthorized:
 		status = http.StatusUnauthorized
+	case errs.KindPersistFailed:
+		// The commit was aborted before publication; clients may retry.
+		status = http.StatusServiceUnavailable
 	}
 	writeError(w, status, version, err)
 }

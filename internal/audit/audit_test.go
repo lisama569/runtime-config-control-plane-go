@@ -31,3 +31,44 @@ func TestAppendOnlyOrdering(t *testing.T) {
 	}
 	t.Log("audit log append-only, sequential seq, copies are isolated")
 }
+
+type fakeSink struct{ payloads [][]byte }
+
+func (f *fakeSink) Append(p []byte) error {
+	f.payloads = append(f.payloads, append([]byte(nil), p...))
+	return nil
+}
+
+func TestRestoreContinuesSeqAndSinkReceivesOnlyNewRecords(t *testing.T) {
+	l := NewLogger()
+	ctx := context.Background()
+	// Simulate entries recovered from disk.
+	l.Restore([]Entry{
+		{Seq: 1, Actor: "a", Result: ResultAllowed},
+		{Seq: 4, Actor: "b", Result: ResultDenied},
+	})
+	sink := &fakeSink{}
+	l.SetSink(sink, nil)
+	seq, err := l.Record(ctx, Entry{Actor: "c", Result: ResultAllowed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seq != 5 {
+		t.Fatalf("seq after restore = %d, want 5 (never reuse)", seq)
+	}
+	if len(sink.payloads) != 1 {
+		t.Fatalf("sink should only receive new records, got %d", len(sink.payloads))
+	}
+	list := l.List()
+	if len(list) != 3 || list[2].Seq != 5 {
+		t.Fatalf("restored+new trail wrong: %+v", list)
+	}
+	// Defensive copy: mutating the input slice must not affect the logger.
+	restored := []Entry{{Seq: 99, Actor: "z"}}
+	l2 := NewLogger()
+	l2.Restore(restored)
+	restored[0].Actor = "mutated"
+	if got := l2.List(); got[0].Actor != "z" {
+		t.Fatalf("restore did not copy entries: %+v", got)
+	}
+}

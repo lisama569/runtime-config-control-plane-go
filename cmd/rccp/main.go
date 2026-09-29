@@ -44,11 +44,12 @@ func (s *sourceFlag) Set(v string) error {
 
 func main() {
 	var srcs sourceFlag
-	var addr, tokensFile string
+	var addr, tokensFile, dataDir string
 	var poll time.Duration
 	flag.Var(&srcs, "source", "configuration source name=priority:path (repeatable)")
 	flag.StringVar(&addr, "addr", "127.0.0.1:8080", "listen address")
 	flag.StringVar(&tokensFile, "tokens-file", "", "JSON file mapping token -> {name, role}")
+	flag.StringVar(&dataDir, "data-dir", ".rccp-data", "directory for durable state and audit journal; empty disables persistence")
 	flag.DurationVar(&poll, "poll", 500*time.Millisecond, "file poll interval")
 	flag.Parse()
 
@@ -74,7 +75,7 @@ func main() {
 	defer cancel()
 
 	plane, err := controlplane.New(ctx, controlplane.Options{
-		Sources: sources, Tokens: tokens, PollInterval: poll,
+		Sources: sources, Tokens: tokens, PollInterval: poll, DataDir: dataDir,
 	})
 	if err != nil {
 		log.Fatalf("startup failed (failing closed): %v", err)

@@ -4,6 +4,7 @@ package controlplane
 
 import (
 	"context"
+	"log"
 	"sort"
 	"sync"
 	"time"
@@ -22,6 +23,14 @@ type Options struct {
 	Sources      []source.Source
 	Tokens       map[string]auth.Principal
 	PollInterval time.Duration
+	// DataDir enables crash-safe persistence: committed effective
+	// configuration (including retained history and API override layers) and
+	// the audit journal are stored here and recovered on restart. An empty
+	// DataDir keeps the purely in-memory behavior.
+	DataDir string
+	// Logger receives recovery/durability diagnostics. Defaults to the
+	// standard logger.
+	Logger *log.Logger
 }
 
 // Plane is the assembled control plane.
@@ -31,6 +40,10 @@ type Plane struct {
 	authz   *auth.Authorizer
 	aud     *audit.Logger
 	sources []source.Source
+	logger  *log.Logger
+
+	dur       *durable
+	recovered bool
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -39,6 +52,11 @@ type Plane struct {
 	layers   map[string]sourceDoc // latest accepted doc per source
 	over     overrideState
 	overHist map[int64]overrideState // override state per effective version
+
+	// commitMu serializes mutating commit flows (API writes, rollbacks,
+	// hot-reload merges) so they never interleave mutations of the override
+	// layer. Read paths stay wait-free on the store's atomic pointer.
+	commitMu sync.Mutex
 }
 
 type sourceDoc struct {
@@ -125,6 +143,13 @@ func New(ctx context.Context, opts Options) (*Plane, error) {
 		layers:   map[string]sourceDoc{},
 		over:     newOverrideState(),
 		overHist: map[int64]overrideState{},
+		logger:   opts.Logger,
+	}
+	if p.logger == nil {
+		p.logger = log.Default()
+	}
+	if opts.DataDir != "" {
+		p.dur = newDurable(opts.DataDir, p.logger)
 	}
 	for _, src := range sorted {
 		doc, ver, err := src.Load(ctx)
@@ -133,20 +158,43 @@ func New(ctx context.Context, opts Options) (*Plane, error) {
 		}
 		p.layers[src.Name()] = sourceDoc{src: src, doc: doc, ver: ver}
 	}
-	res, err := p.remerge()
-	if err != nil {
-		return nil, err
+
+	if p.dur != nil {
+		// Recovery happens BEFORE the plane serves any request or starts
+		// watching: callers either get the fully recovered state or an error.
+		if err := p.restoreFromDisk(); err != nil {
+			return nil, err
+		}
 	}
-	snap := &config.Snapshot{
-		Version:        1,
-		Doc:            res.Doc,
-		PropertyOrigin: res.PropertyOrigin,
-		FeatureOrigin:  res.FeatureOrigin,
-		SourceVersions: res.SourceVersions,
-		CreatedAtUnix:  time.Now().Unix(),
+	if !p.recovered {
+		res, err := p.remerge()
+		if err != nil {
+			return nil, err
+		}
+		snap := &config.Snapshot{
+			Version:        1,
+			Doc:            res.Doc,
+			PropertyOrigin: res.PropertyOrigin,
+			FeatureOrigin:  res.FeatureOrigin,
+			SourceVersions: res.SourceVersions,
+			CreatedAtUnix:  time.Now().Unix(),
+		}
+		if p.dur != nil {
+			// Durable bootstrap: version 1 must be on disk before it is live.
+			if err := p.persistInitial(snap); err != nil {
+				return nil, err
+			}
+		}
+		p.store = store.NewMemoryWithHook(snap, p.persistHook)
+		p.overHist[1] = p.over.clone()
+		if p.dur != nil {
+			// Load any pre-existing journal (or repair a leftover torn tail)
+			// and attach the sink before any new audit record is appended.
+			if err := p.loadAuditJournal(); err != nil {
+				return nil, err
+			}
+		}
 	}
-	p.store = store.NewMemory(snap)
-	p.overHist[1] = p.over.clone()
 
 	rctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
@@ -200,6 +248,8 @@ func (p *Plane) consumeEvents(ctx context.Context, ch <-chan source.UpdateEvent)
 }
 
 func (p *Plane) applySourceEvent(ctx context.Context, ev source.UpdateEvent) {
+	p.commitMu.Lock()
+	defer p.commitMu.Unlock()
 	p.mu.Lock()
 	p.layers[ev.Source.Name()] = sourceDoc{src: ev.Source, doc: ev.Doc, ver: ev.Version}
 	p.mu.Unlock()
@@ -209,7 +259,15 @@ func (p *Plane) applySourceEvent(ctx context.Context, ev source.UpdateEvent) {
 	for attempt := 0; ; attempt++ {
 		cur := p.store.Current()
 		p.mu.Lock()
+		// Drop any provisional layer left by a previous failed attempt before
+		// recomputing the candidate for this attempt.
+		delete(p.overHist, cur.Version+1)
 		res, err := p.remergeLocked()
+		if err == nil {
+			// Pre-register the candidate layer so the pre-publish hook
+			// serializes exactly this state; cleaned up on failure.
+			p.overHist[cur.Version+1] = p.over.clone()
+		}
 		p.mu.Unlock()
 		if err != nil {
 			_, _ = p.aud.Record(ctx, audit.Entry{
@@ -227,7 +285,6 @@ func (p *Plane) applySourceEvent(ctx context.Context, ev source.UpdateEvent) {
 		})
 		if cerr == nil {
 			p.mu.Lock()
-			p.overHist[snap.Version] = p.over.clone()
 			p.trimOverHist()
 			p.mu.Unlock()
 			_, _ = p.aud.Record(ctx, audit.Entry{
@@ -239,6 +296,9 @@ func (p *Plane) applySourceEvent(ctx context.Context, ev source.UpdateEvent) {
 			return
 		}
 		if !errIs(cerr, errKindStale) {
+			p.mu.Lock()
+			delete(p.overHist, cur.Version+1)
+			p.mu.Unlock()
 			_, _ = p.aud.Record(ctx, audit.Entry{
 				Actor: "system", Action: "source:reload", Target: ev.Source.Name(),
 				Result: audit.ResultError, Reason: cerr.Error(),
@@ -247,6 +307,9 @@ func (p *Plane) applySourceEvent(ctx context.Context, ev source.UpdateEvent) {
 			return
 		}
 		if attempt > 8 {
+			p.mu.Lock()
+			delete(p.overHist, cur.Version+1)
+			p.mu.Unlock()
 			return
 		}
 	}
@@ -257,6 +320,17 @@ func (p *Plane) remerge() (*merge.Result, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.remergeLocked()
+}
+
+// remergeWithLocked builds the effective document from sources and the
+// supplied candidate override layer without mutating p.over. Caller holds
+// p.mu.
+func (p *Plane) remergeWithLocked(candidate overrideState) (*merge.Result, error) {
+	saved := p.over
+	p.over = candidate
+	res, err := p.remergeLocked()
+	p.over = saved
+	return res, err
 }
 
 func (p *Plane) remergeLocked() (*merge.Result, error) {
@@ -313,7 +387,10 @@ func (p *Plane) trimOverHist() {
 	if len(p.overHist) <= maxOverHist {
 		return
 	}
-	// Collect versions, drop oldest beyond bound (version 1 retained).
+	// Drop oldest versions beyond the bound so the override timeline matches
+	// the store's retained rollback window exactly (same versions, same
+	// count). Version 1 ages out like every other version once the window
+	// slides past it; it can no longer be a rollback target anyway.
 	vers := make([]int64, 0, len(p.overHist))
 	for v := range p.overHist {
 		vers = append(vers, v)
@@ -321,9 +398,6 @@ func (p *Plane) trimOverHist() {
 	sort.Slice(vers, func(i, j int) bool { return vers[i] < vers[j] })
 	drop := len(vers) - maxOverHist
 	for i := 0; i < drop; i++ {
-		if vers[i] == 1 {
-			continue
-		}
 		delete(p.overHist, vers[i])
 	}
 }

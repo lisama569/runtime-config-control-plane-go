@@ -167,3 +167,57 @@ func TestConcurrentReadersNeverSeeHalfState(t *testing.T) {
 	wg.Wait()
 	t.Logf("[version=%d] concurrent readers always observed whole snapshots", s.Current().Version)
 }
+
+func TestBeforePublishHookFailureAbortsCommit(t *testing.T) {
+	initial := initialSnap()
+	s := NewMemoryWithHook(initial, func(snap *config.Snapshot, history []*config.Snapshot) error {
+		return errs.New(errs.KindPersistFailed, "simulated disk failure")
+	})
+	ctx := context.Background()
+	before := s.Current()
+	if _, err := s.CAS(ctx, before.Version, docWith("k", 2), Change{}); err == nil {
+		t.Fatal("expected hook failure to abort the CAS")
+	} else if !errs.Of(err, errs.KindPersistFailed) {
+		t.Fatalf("want PERSIST_FAILED, got %v", errs.Classify(err))
+	}
+	if s.Current().Version != before.Version {
+		t.Fatalf("current advanced despite hook failure: %d", s.Current().Version)
+	}
+	if got := s.History(); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("history mutated despite hook failure: %v", got)
+	}
+	// A later successful commit recomputes version+1 from the still-current
+	// snapshot: rejected version number is not reused as a duplicate commit.
+	s2 := NewMemoryWithHook(initial, func(snap *config.Snapshot, history []*config.Snapshot) error {
+		return nil
+	})
+	snap, err := s2.CAS(ctx, 1, docWith("k", 2), Change{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Version != 2 {
+		t.Fatalf("next commit version = %d want 2", snap.Version)
+	}
+}
+
+func TestHookSeesTrimmedHistory(t *testing.T) {
+	initial := initialSnap()
+	var seen int
+	s := NewMemoryWithHook(initial, func(snap *config.Snapshot, history []*config.Snapshot) error {
+		seen = len(history)
+		return nil
+	})
+	ctx := context.Background()
+	for i := 0; i < 150; i++ {
+		cur := s.Current()
+		if _, err := s.CAS(ctx, cur.Version, docWith("k", cur.Version+1), Change{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if seen != maxHistory {
+		t.Fatalf("hook saw %d history entries, want trimmed %d", seen, maxHistory)
+	}
+	if got := len(s.History()); got != maxHistory {
+		t.Fatalf("history len = %d want %d", got, maxHistory)
+	}
+}

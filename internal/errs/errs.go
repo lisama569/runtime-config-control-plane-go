@@ -17,6 +17,16 @@ const (
 	KindTypeMismatch   Kind = "TYPE_MISMATCH"
 	KindMissingValue   Kind = "MISSING_VALUE"
 	KindRollbackFailed Kind = "ROLLBACK_FAILED"
+	// KindPersistFailed is an I/O / capacity failure while durably storing
+	// state. The in-memory commit is aborted, so live and durable state never
+	// diverge silently.
+	KindPersistFailed Kind = "PERSIST_FAILED"
+	// KindStateCorrupt means persisted bytes were found unreadable or failed
+	// their checksum; the content must not be treated as a valid commit.
+	KindStateCorrupt Kind = "STATE_CORRUPT"
+	// KindStateInconsistent means persisted content parsed but violates the
+	// timeline invariants (non-monotonic or missing versions).
+	KindStateInconsistent Kind = "STATE_INCONSISTENT"
 )
 
 // Error is a classified error carrying a stable Kind.

@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"github.com/lisama569/runtime-config-control-plane-go/internal/audit"
-	"github.com/lisama569/runtime-config-control-plane-go/internal/config"
 	"github.com/lisama569/runtime-config-control-plane-go/internal/store"
 )
 
@@ -41,6 +40,8 @@ type jsonRaw = rawMessage
 // NOTHING changes. Validation failures are all-or-nothing: no key from the
 // request is applied if any key is invalid.
 func (p *Plane) ApplyPatch(ctx context.Context, actor string, req PatchRequest) (from, to int64, err error) {
+	p.commitMu.Lock()
+	defer p.commitMu.Unlock()
 	cur := p.store.Current()
 	from = cur.Version
 	if req.ExpectedVersion != cur.Version {
@@ -55,55 +56,63 @@ func (p *Plane) ApplyPatch(ctx context.Context, actor string, req PatchRequest) 
 
 	p.mu.Lock()
 	next := p.over.clone()
-	// Build candidate effective document from current snapshot, then apply ops.
-	cand := cloneDoc(cur.Doc)
-	if err := applyPropertyOps(cand, next, req.Properties); err != nil {
+	if verr := applyPropertyOps(cur.Doc, next, req.Properties); verr != nil {
 		p.mu.Unlock()
 		_, _ = p.aud.Record(ctx, audit.Entry{
 			Actor: actor, Action: string(actWrite), Target: "config",
-			Result: audit.ResultError, Reason: err.Error(),
-			ErrKind: errKindString(err), FromVer: cur.Version,
+			Result: audit.ResultError, Reason: verr.Error(),
+			ErrKind: errKindString(verr), FromVer: cur.Version,
 		})
-		return from, 0, err
+		return from, 0, verr
 	}
-	if err := applyFeatureOps(cand, next, req.Features); err != nil {
+	if verr := applyFeatureOps(cur.Doc, next, req.Features); verr != nil {
 		p.mu.Unlock()
 		_, _ = p.aud.Record(ctx, audit.Entry{
 			Actor: actor, Action: string(actWrite), Target: "config",
-			Result: audit.ResultError, Reason: err.Error(),
-			ErrKind: errKindString(err), FromVer: cur.Version,
+			Result: audit.ResultError, Reason: verr.Error(),
+			ErrKind: errKindString(verr), FromVer: cur.Version,
 		})
-		return from, 0, err
+		return from, 0, verr
 	}
+	// Build the exact effective document (sources + override + tombstones).
+	res, rerr := p.remergeWithLocked(next)
+	if rerr != nil {
+		p.mu.Unlock()
+		_, _ = p.aud.Record(ctx, audit.Entry{
+			Actor: actor, Action: string(actWrite), Target: "config",
+			Result: audit.ResultError, Reason: rerr.Error(),
+			ErrKind: errKindString(rerr), FromVer: cur.Version,
+		})
+		return from, 0, rerr
+	}
+	newVersion := cur.Version + 1
+	// Publish the candidate layer and pre-register it so the store's
+	// pre-publish hook serializes exactly this state. p.over is reverted on
+	// any failure below.
 	p.over = next
+	p.overHist[newVersion] = next
 	p.mu.Unlock()
 
-	// Verify against a freshly remerged document so source-derived entries and
-	// tombstones are represented exactly.
-	res, err := p.remerge()
-	if err != nil {
-		return from, 0, err
-	}
 	snap, cerr := p.store.CAS(ctx, cur.Version, res.Doc, store.Change{
 		Reason: "api-patch", Actor: actor,
 		Origin: res.PropertyOrigin, Features: res.FeatureOrigin,
 	})
 	if cerr != nil {
-		// Lost the race: revert in-memory override and demand client retry.
 		p.mu.Lock()
+		delete(p.overHist, newVersion)
 		if prev, ok := p.overHist[cur.Version]; ok {
 			p.over = prev
 		}
 		p.mu.Unlock()
 		_, _ = p.aud.Record(ctx, audit.Entry{
 			Actor: actor, Action: string(actWrite), Target: "config",
-			Result: audit.ResultDenied, Reason: cerr.Error(),
+			Result:  audit.ResultDenied,
+			Reason:  cerr.Error(),
 			ErrKind: errKindString(cerr), FromVer: cur.Version,
 		})
 		return from, 0, cerr
 	}
 	p.mu.Lock()
-	p.overHist[snap.Version] = next
 	p.trimOverHist()
 	p.mu.Unlock()
 	_, _ = p.aud.Record(ctx, audit.Entry{
@@ -120,6 +129,8 @@ func (p *Plane) ApplyPatch(ctx context.Context, actor string, req PatchRequest) 
 // state associated with that version is restored as well, so the resulting
 // effective config is identical to the target's and remains explainable.
 func (p *Plane) Rollback(ctx context.Context, actor string, targetVersion int64) (from, to int64, err error) {
+	p.commitMu.Lock()
+	defer p.commitMu.Unlock()
 	cur := p.store.Current()
 	from = cur.Version
 	if _, ok := p.store.AtVersion(targetVersion); !ok {
@@ -133,17 +144,31 @@ func (p *Plane) Rollback(ctx context.Context, actor string, targetVersion int64)
 	}
 	p.mu.Lock()
 	ov, known := p.overHist[targetVersion]
-	if known {
-		p.over = ov.clone()
-	} else {
+	if !known {
 		// Should not happen while history bounds agree; fail closed if it does.
 		p.mu.Unlock()
+		_, _ = p.aud.Record(ctx, audit.Entry{
+			Actor: actor, Action: string(actRollback), Target: itoa(targetVersion),
+			Result: audit.ResultError, Reason: rollbackStateErr(targetVersion).Error(),
+			ErrKind: "ROLLBACK_FAILED", FromVer: cur.Version,
+		})
 		return from, 0, rollbackStateErr(targetVersion)
 	}
+	p.over = ov.clone()
+	newVersion := cur.Version + 1
+	// Pre-register so the pre-publish hook serializes exactly this state.
+	p.overHist[newVersion] = ov.clone()
 	p.mu.Unlock()
 
 	snap, cerr := p.store.Rollback(ctx, targetVersion, actor)
 	if cerr != nil {
+		p.mu.Lock()
+		delete(p.overHist, newVersion)
+		// Restore the live override layer of the still-current version.
+		if prev, ok := p.overHist[cur.Version]; ok {
+			p.over = prev
+		}
+		p.mu.Unlock()
 		_, _ = p.aud.Record(ctx, audit.Entry{
 			Actor: actor, Action: string(actRollback), Target: itoa(targetVersion),
 			Result: audit.ResultError, Reason: cerr.Error(),
@@ -152,7 +177,6 @@ func (p *Plane) Rollback(ctx context.Context, actor string, targetVersion int64)
 		return from, 0, cerr
 	}
 	p.mu.Lock()
-	p.overHist[snap.Version] = ov.clone()
 	p.trimOverHist()
 	p.mu.Unlock()
 	_, _ = p.aud.Record(ctx, audit.Entry{
@@ -162,27 +186,4 @@ func (p *Plane) Rollback(ctx context.Context, actor string, targetVersion int64)
 		FromVer: from, ToVer: snap.Version,
 	})
 	return from, snap.Version, nil
-}
-
-func cloneDoc(d *config.Document) *config.Document {
-	c := &config.Document{
-		Properties: make(map[string]config.Property, len(d.Properties)),
-		Features:   make(map[string]config.Feature, len(d.Features)),
-	}
-	for k, v := range d.Properties {
-		c.Properties[k] = v
-	}
-	for k, v := range d.Features {
-		v.AllowList = cloneBoolSet(v.AllowList)
-		c.Features[k] = v
-	}
-	return c
-}
-
-func cloneBoolSet(m map[string]bool) map[string]bool {
-	out := make(map[string]bool, len(m))
-	for k := range m {
-		out[k] = true
-	}
-	return out
 }

@@ -28,14 +28,17 @@ func rollbackStateErr(v int64) error {
 		"cannot reconstruct override state for version "+itoa(v), nil)
 }
 
-func applyPropertyOps(doc *config.Document, over overrideState, ops []PatchOp) error {
+func applyPropertyOps(cur *config.Document, over overrideState, ops []PatchOp) error {
 	for _, op := range ops {
 		if op.Key == "" {
 			return errs.New(errs.KindValidation, "patch: property key must not be empty")
 		}
 		if op.Delete {
-			delete(doc.Properties, op.Key)
-			over.props[op.Key] = config.Property{Key: op.Key}
+			if existing, ok := cur.Properties[op.Key]; ok {
+				over.props[op.Key] = existing
+			} else {
+				over.props[op.Key] = config.Property{Key: op.Key}
+			}
 			over.deadProps[op.Key] = true
 			continue
 		}
@@ -43,32 +46,45 @@ func applyPropertyOps(doc *config.Document, over overrideState, ops []PatchOp) e
 		if err != nil {
 			return err
 		}
-		if existing, ok := doc.Properties[op.Key]; ok {
+		// Version baseline prefers the live override entry (it may carry a
+		// tombstone or an API-only value), then the effective document.
+		if existing, ok := over.props[op.Key]; ok && !over.deadProps[op.Key] {
+			prop.Version = existing.Version + 1
+		} else if existing, ok := cur.Properties[op.Key]; ok {
 			prop.Version = existing.Version + 1
 		}
-		doc.Properties[op.Key] = prop
 		over.props[op.Key] = prop
 		delete(over.deadProps, op.Key)
 	}
 	return nil
 }
 
-func applyFeatureOps(doc *config.Document, over overrideState, ops []FeatureOp) error {
+func applyFeatureOps(cur *config.Document, over overrideState, ops []FeatureOp) error {
 	for _, op := range ops {
 		if op.Name == "" {
 			return errs.New(errs.KindValidation, "patch: feature name must not be empty")
 		}
 		if op.Delete {
-			delete(doc.Features, op.Name)
-			over.feats[op.Name] = config.Feature{Name: op.Name}
+			if existing, ok := cur.Features[op.Name]; ok {
+				over.feats[op.Name] = existing
+			} else {
+				over.feats[op.Name] = config.Feature{Name: op.Name}
+			}
 			over.deadFeats[op.Name] = true
 			continue
 		}
 		rf := config.RawFeature{AllowList: op.AllowList}
-		if cur, ok := doc.Features[op.Name]; ok {
-			rf.Enabled = cur.Enabled
-			rf.Percentage = cur.Percentage
-			for s := range cur.AllowList {
+		// Baseline prefers the live override feature, then the effective one.
+		var base *config.Feature
+		if f, ok := over.feats[op.Name]; ok && !over.deadFeats[op.Name] {
+			base = &f
+		} else if f, ok := cur.Features[op.Name]; ok {
+			base = &f
+		}
+		if base != nil {
+			rf.Enabled = base.Enabled
+			rf.Percentage = base.Percentage
+			for s := range base.AllowList {
 				rf.AllowList = append(rf.AllowList, s)
 			}
 		}
@@ -82,7 +98,6 @@ func applyFeatureOps(doc *config.Document, over overrideState, ops []FeatureOp) 
 		if err != nil {
 			return err
 		}
-		doc.Features[op.Name] = feat
 		over.feats[op.Name] = feat
 		delete(over.deadFeats, op.Name)
 	}
