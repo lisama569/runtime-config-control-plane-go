@@ -36,11 +36,34 @@ type PatchRequest struct {
 type jsonRaw = rawMessage
 
 // ApplyPatch validates and commits an authorized write.
-// Concurrency rule: the commit succeeds only if the live version still equals
-// ExpectedVersion; otherwise a STALE_VERSION error is returned explicitly and
-// NOTHING changes. Validation failures are all-or-nothing: no key from the
-// request is applied if any key is invalid.
+// Concurrency rule: an advisory version precheck happens lock-free (the live
+// snapshot is an atomic pointer), then the whole read-modify-commit sequence
+// is serialized by p.mu — including the authoritative version check and the
+// durability hook. A request that loses the race therefore fails with
+// STALE_VERSION inside the serialized section BEFORE any shared state can be
+// touched, and changes nothing: not the live override layer, not retained
+// history, not durable state. Validation failures are all-or-nothing.
 func (p *Plane) ApplyPatch(ctx context.Context, actor string, req PatchRequest) (from, to int64, err error) {
+	// Advisory precheck against the wait-free live snapshot. It only rejects
+	// obviously stale requests early; the authoritative check is repeated
+	// under the lock, where losing racers are stopped before mutating anything.
+	cur0 := p.store.Current()
+	if req.ExpectedVersion != cur0.Version {
+		_, _ = p.aud.Record(ctx, audit.Entry{
+			Actor: actor, Action: string(actWrite), Target: "config",
+			Result:  audit.ResultDenied,
+			Reason:  "expected version " + itoa(req.ExpectedVersion) + " but current is " + itoa(cur0.Version),
+			ErrKind: "STALE_VERSION", FromVer: cur0.Version,
+		})
+		return cur0.Version, 0, staleErr(cur0.Version, req.ExpectedVersion)
+	}
+	if p.testPreCommit != nil {
+		p.testPreCommit()
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	cur := p.store.Current()
 	from = cur.Version
 	if req.ExpectedVersion != cur.Version {
@@ -53,55 +76,50 @@ func (p *Plane) ApplyPatch(ctx context.Context, actor string, req PatchRequest) 
 		return from, 0, staleErr(cur.Version, req.ExpectedVersion)
 	}
 
-	p.mu.Lock()
+	// Build the candidate entirely from LOCAL state. The live override layer
+	// is not touched until the commit has succeeded, so a losing/aborted
+	// transaction cannot leak any value into the shared state.
 	next := p.over.clone()
-	// Build candidate effective document from current snapshot, then apply ops.
 	cand := cloneDoc(cur.Doc)
-	if err := applyPropertyOps(cand, next, req.Properties); err != nil {
-		p.mu.Unlock()
+	if verr := applyPropertyOps(cand, next, req.Properties); verr != nil {
 		_, _ = p.aud.Record(ctx, audit.Entry{
 			Actor: actor, Action: string(actWrite), Target: "config",
-			Result: audit.ResultError, Reason: err.Error(),
-			ErrKind: errKindString(err), FromVer: cur.Version,
+			Result: audit.ResultError, Reason: verr.Error(),
+			ErrKind: errKindString(verr), FromVer: cur.Version,
 		})
-		return from, 0, err
+		return from, 0, verr
 	}
-	if err := applyFeatureOps(cand, next, req.Features); err != nil {
-		p.mu.Unlock()
+	if verr := applyFeatureOps(cand, next, req.Features); verr != nil {
 		_, _ = p.aud.Record(ctx, audit.Entry{
 			Actor: actor, Action: string(actWrite), Target: "config",
-			Result: audit.ResultError, Reason: err.Error(),
-			ErrKind: errKindString(err), FromVer: cur.Version,
+			Result: audit.ResultError, Reason: verr.Error(),
+			ErrKind: errKindString(verr), FromVer: cur.Version,
 		})
-		return from, 0, err
+		return from, 0, verr
 	}
-	p.over = next
-	p.mu.Unlock()
 
-	// Verify against a freshly remerged document so source-derived entries and
-	// tombstones are represented exactly.
-	res, err := p.remerge()
-	if err != nil {
-		return from, 0, err
+	// Re-verify against a freshly remerged document so source-derived entries
+	// and tombstones are represented exactly — using the tentative override,
+	// never the shared live layer.
+	res, rerr := p.remergeWithLocked(next)
+	if rerr != nil {
+		return from, 0, rerr
 	}
-	// Stage the override state for the version we are about to publish so the
-	// durability hook (run inside the store's commit) can persist it before
-	// the new snapshot becomes visible.
+
 	newVersion := cur.Version + 1
-	p.stagePending(newVersion, next)
+	p.beginTxLocked(next)
+	// Seed the tentative durable timeline so the hook can persist the full
+	// window atomically; it is discarded on any failure.
+	p.txHist[newVersion] = next.clone()
 	snap, cerr := p.store.CAS(ctx, cur.Version, res.Doc, store.Change{
 		Reason: "api-patch", Actor: actor,
 		Origin: res.PropertyOrigin, Features: res.FeatureOrigin,
 	})
-	p.clearPending(newVersion)
 	if cerr != nil {
-		// Lost the race (or durability failed): revert in-memory override and
-		// demand client retry. Nothing was published or made durable.
-		p.mu.Lock()
-		if prev, ok := p.overHist[cur.Version]; ok {
-			p.over = prev
-		}
-		p.mu.Unlock()
+		// Lost the race or durability failed: no snapshot was published and no
+		// durable state changed. Discard the tentative layer entirely; a failed
+		// request can never roll back or corrupt a previously successful commit.
+		p.abortTxLocked()
 		_, _ = p.aud.Record(ctx, audit.Entry{
 			Actor: actor, Action: string(actWrite), Target: "config",
 			Result: audit.ResultDenied, Reason: cerr.Error(),
@@ -109,8 +127,7 @@ func (p *Plane) ApplyPatch(ctx context.Context, actor string, req PatchRequest) 
 		})
 		return from, 0, cerr
 	}
-	// Override history for snap.Version was already committed inside the
-	// store's durability hook (atomically with persistence).
+	p.commitTxLocked(snap.Version)
 	_, _ = p.aud.Record(ctx, audit.Entry{
 		Actor: actor, Action: string(actWrite), Target: "config",
 		Result:  audit.ResultAllowed,
@@ -125,6 +142,13 @@ func (p *Plane) ApplyPatch(ctx context.Context, actor string, req PatchRequest) 
 // state associated with that version is restored as well, so the resulting
 // effective config is identical to the target's and remains explainable.
 func (p *Plane) Rollback(ctx context.Context, actor string, targetVersion int64) (from, to int64, err error) {
+	if p.testPreCommit != nil {
+		p.testPreCommit()
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	cur := p.store.Current()
 	from = cur.Version
 	if _, ok := p.store.AtVersion(targetVersion); !ok {
@@ -136,30 +160,18 @@ func (p *Plane) Rollback(ctx context.Context, actor string, targetVersion int64)
 		})
 		return from, 0, rollbackErr(targetVersion)
 	}
-	p.mu.Lock()
 	ov, known := p.overHist[targetVersion]
-	// Remember the current override so a failed/durability-aborted rollback
-	// restores in-memory state to match the unchanged live snapshot.
-	curOv, curKnown := p.overHist[cur.Version]
-	if known {
-		p.over = ov.clone()
-	} else {
+	if !known {
 		// Should not happen while history bounds agree; fail closed if it does.
-		p.mu.Unlock()
 		return from, 0, rollbackStateErr(targetVersion)
 	}
-	p.mu.Unlock()
 
 	newVersion := cur.Version + 1
-	p.stagePending(newVersion, ov)
+	p.beginTxLocked(ov)
+	p.txHist[newVersion] = ov.clone()
 	snap, cerr := p.store.Rollback(ctx, targetVersion, actor)
-	p.clearPending(newVersion)
 	if cerr != nil {
-		if curKnown {
-			p.mu.Lock()
-			p.over = curOv.clone()
-			p.mu.Unlock()
-		}
+		p.abortTxLocked()
 		_, _ = p.aud.Record(ctx, audit.Entry{
 			Actor: actor, Action: string(actRollback), Target: itoa(targetVersion),
 			Result: audit.ResultError, Reason: cerr.Error(),
@@ -167,7 +179,7 @@ func (p *Plane) Rollback(ctx context.Context, actor string, targetVersion int64)
 		})
 		return from, 0, cerr
 	}
-	// Override history for the new version was committed in the hook.
+	p.commitTxLocked(snap.Version)
 	_, _ = p.aud.Record(ctx, audit.Entry{
 		Actor: actor, Action: string(actRollback), Target: itoa(targetVersion),
 		Result:  audit.ResultAllowed,

@@ -54,11 +54,24 @@ type Plane struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mu          sync.Mutex
-	layers      map[string]sourceDoc // latest accepted doc per source
-	over        overrideState
-	overHist    map[int64]overrideState // override state per effective version
-	pendingOver map[int64]overrideState // staged for the in-flight durable commit
+	// mu is the SINGLE serialization point for every state transition (API
+	// writes, rollbacks and hot reloads). All read-modify-commit work happens
+	// while holding it, including the durability hook invoked by the store
+	// (lock order is therefore always mu -> store.mu, never the reverse), so
+	// two transitions can never interleave and a losing/aborted transaction
+	// can never mutate the shared layer state.
+	mu       sync.Mutex
+	layers   map[string]sourceDoc    // latest accepted doc per source
+	over     overrideState           // live api-override layer
+	overHist map[int64]overrideState // override state per effective version
+	txOver   *overrideState          // non-nil only inside an in-flight commit: the override that goes with the candidate snapshot
+	txHist   map[int64]overrideState // tentative history staged for the in-flight commit
+
+	// testPreCommit is a TEST-ONLY seam: when non-nil it is invoked inside the
+	// serialized commit section just before durability/visibility, letting
+	// tests force deterministic goroutine interleavings. Production code never
+	// sets it.
+	testPreCommit func()
 }
 
 type sourceDoc struct {
@@ -143,15 +156,14 @@ func New(ctx context.Context, opts Options) (*Plane, error) {
 	})
 
 	p := &Plane{
-		eval:        flag.NewEvaluator(),
-		authz:       auth.NewAuthorizer(opts.Tokens),
-		aud:         audit.NewLogger(),
-		sources:     sorted,
-		layers:      map[string]sourceDoc{},
-		over:        newOverrideState(),
-		overHist:    map[int64]overrideState{},
-		pendingOver: map[int64]overrideState{},
-		persistLog:  opts.PersistLogger,
+		eval:       flag.NewEvaluator(),
+		authz:      auth.NewAuthorizer(opts.Tokens),
+		aud:        audit.NewLogger(),
+		sources:    sorted,
+		layers:     map[string]sourceDoc{},
+		over:       newOverrideState(),
+		overHist:   map[int64]overrideState{},
+		persistLog: opts.PersistLogger,
 	}
 
 	// Sources still load at startup: failure to read any source fails closed,
@@ -189,24 +201,24 @@ func New(ctx context.Context, opts Options) (*Plane, error) {
 			return nil, err
 		}
 	} else {
+		p.mu.Lock()
 		snap, err := p.bootstrapFromSourcesLocked()
 		if err != nil {
+			p.mu.Unlock()
 			return nil, err
 		}
 		p.overHist[1] = p.over.clone()
-		var hook store.BeforeCommit
-		if p.persist != nil {
-			hook = p.persistHook()
-		}
-		p.store = store.NewMemoryWithHook(snap, hook)
+		p.store = store.NewMemoryWithHook(snap, p.persistHook())
 		if p.persist != nil {
 			// Make the initial bootstrap durable BEFORE serving. Failure here
 			// aborts startup (fail closed) rather than serving non-durable v1.
-			p.stagePending(snap.Version, p.overHist[1])
-			if err := p.saveDurable(ctx, snap, []*config.Snapshot{snap}); err != nil {
+			if err := p.writeStateLocked(context.Background(), snap,
+				[]*config.Snapshot{snap}, p.overHist[1]); err != nil {
+				p.mu.Unlock()
 				return nil, err
 			}
 		}
+		p.mu.Unlock()
 	}
 
 	if p.persist != nil {
@@ -224,38 +236,59 @@ func New(ctx context.Context, opts Options) (*Plane, error) {
 	return p, nil
 }
 
-// stagePending records the override state for the version a commit is about
-// to publish, so the durability hook can persist it inside the store section.
-func (p *Plane) stagePending(v int64, ov overrideState) {
-	p.mu.Lock()
-	p.pendingOver[v] = ov.clone()
-	p.mu.Unlock()
+// beginTxLocked stages a candidate override state for the in-flight commit.
+// The caller MUST hold mu and MUST call either commitTxLocked (after a
+// successful durable commit/visibility) or abortTxLocked (on any failure).
+// Nothing staged here is observable by another transition until commit.
+func (p *Plane) beginTxLocked(ov overrideState) {
+	ov = ov.clone()
+	p.txOver = &ov
+	p.txHist = cloneOverHist(p.overHist)
 }
 
-// clearPending drops the staged entry after a finished/failed commit.
-func (p *Plane) clearPending(v int64) {
-	p.mu.Lock()
-	delete(p.pendingOver, v)
-	p.mu.Unlock()
+// commitTxLocked publishes the staged override layer/timeline. It runs after
+// the store has made the new snapshot durable and visible, so the in-memory
+// override layer can never describe a different config than the live snapshot.
+func (p *Plane) commitTxLocked(newVersion int64) {
+	if p.txOver == nil {
+		panic("controlplane: commitTxLocked without beginTxLocked")
+	}
+	p.over = p.txOver.clone()
+	p.overHist[newVersion] = p.txOver.clone()
+	p.trimOverHist()
+	p.txOver = nil
+	p.txHist = nil
 }
 
-// saveDurable assembles the persist.State for snap + retained history and
-// writes it through the durability backend. It runs inside the store's
-// serialized commit (holding p.mu), so committing the new override-history
-// entry here makes it visible to every later commit's durability write even
-// when two clients race: a later hook can never observe a missing entry.
-func (p *Plane) saveDurable(ctx context.Context, snap *config.Snapshot, history []*config.Snapshot) error {
+// abortTxLocked discards the staged transaction, leaving the live override
+// layer and timeline exactly as they were. A rejected/stale/failed request
+// therefore leaves no trace whatsoever.
+func (p *Plane) abortTxLocked() {
+	p.txOver = nil
+	p.txHist = nil
+}
+
+// writeStateLocked serializes snap together with the override state that
+// describes it. It is called either for the initial bootstrap or from the
+// store's pre-commit hook; in both cases mu is held and the override passed in
+// is exactly the one the published snapshot was built from, so what clients
+// see, what lands on disk and what a later restart recovers are one and the
+// same configuration.
+func (p *Plane) writeStateLocked(ctx context.Context, snap *config.Snapshot, history []*config.Snapshot, ov overrideState) error {
 	if p.persist == nil {
 		return nil
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if ov, ok := p.pendingOver[snap.Version]; ok {
-		// Commit the staged override state into the timeline atomically with
-		// durability, then release the staging slot.
-		p.overHist[snap.Version] = ov
-		p.trimOverHist()
-		delete(p.pendingOver, snap.Version)
+	// Prefer the staged tentative timeline (covers the in-flight version); for
+	// the bootstrap call use the live timeline plus the explicit override.
+	ovm := p.txHist
+	if ovm == nil {
+		ovm = map[int64]overrideState{}
+		for v, o := range p.overHist {
+			ovm[v] = o
+		}
+	}
+	if _, known := ovm[snap.Version]; !known {
+		ovm[snap.Version] = ov
 	}
 	st := &persist.State{
 		Current:   snap,
@@ -263,13 +296,21 @@ func (p *Plane) saveDurable(ctx context.Context, snap *config.Snapshot, history 
 		Overrides: map[int64]persist.Override{},
 	}
 	for _, h := range history {
-		hov, known := p.overHist[h.Version]
+		hov, known := ovm[h.Version]
 		if !known {
 			return persistStateErr(h.Version)
 		}
 		st.Overrides[h.Version] = toPersistOverride(hov)
 	}
 	return p.persist.SaveState(ctx, st)
+}
+
+func cloneOverHist(m map[int64]overrideState) map[int64]overrideState {
+	out := make(map[int64]overrideState, len(m)+1)
+	for v, o := range m {
+		out[v] = o.clone()
+	}
+	return out
 }
 
 // applyRestored rebuilds in-memory store and override timeline from a durable
@@ -292,8 +333,9 @@ func (p *Plane) applyRestored(st *persist.State) error {
 }
 
 // bootstrapFromSourcesLocked merges current sources with an empty override.
+// The caller holds mu.
 func (p *Plane) bootstrapFromSourcesLocked() (*config.Snapshot, error) {
-	res, err := p.remerge()
+	res, err := p.remergeLocked()
 	if err != nil {
 		return nil, err
 	}
@@ -349,36 +391,50 @@ func (p *Plane) consumeEvents(ctx context.Context, ch <-chan source.UpdateEvent)
 	}
 }
 
+// applySourceEvent merges a freshly accepted source document into the
+// effective config. The layer swap plus the read-modify-commit sequence
+// (including the durability hook) is serialized by mu, so a hot reload can
+// never interleave with an API write: a reload racing a committed write loses
+// the CAS and is retried from the newest snapshot, while a reload that wins is
+// the only transition of its version. The new layer is installed inside the
+// same section as the commit, and reverted on failure, so a losing/aborted
+// reload cannot leak its document.
 func (p *Plane) applySourceEvent(ctx context.Context, ev source.UpdateEvent) {
-	p.mu.Lock()
-	p.layers[ev.Source.Name()] = sourceDoc{src: ev.Source, doc: ev.Doc, ver: ev.Version}
-	p.mu.Unlock()
+	// Test seam (outside the lock): lets concurrency tests line up a reload and
+	// writes at the same starting version before any of them enters the section.
+	if p.testPreCommit != nil {
+		p.testPreCommit()
+	}
 
-	// Serialized retry: rebuild + CAS until committed or rejected. The store
-	// guarantees concurrent writers never silently overwrite each other.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	name := ev.Source.Name()
+	prev := p.layers[name]
+	p.layers[name] = sourceDoc{src: ev.Source, doc: ev.Doc, ver: ev.Version}
+
 	for attempt := 0; ; attempt++ {
 		cur := p.store.Current()
-		p.mu.Lock()
 		res, err := p.remergeLocked()
-		p.mu.Unlock()
 		if err != nil {
+			// Invalid merge candidate: keep the source's last accepted layer
+			// so the last valid effective config is retained, audit and stop.
+			p.layers[name] = prev
 			_, _ = p.aud.Record(ctx, audit.Entry{
-				Actor: "system", Action: "source:reload", Target: ev.Source.Name(),
+				Actor: "system", Action: "source:reload", Target: name,
 				Result: audit.ResultError, Reason: err.Error(),
 				ErrKind: errKindString(err), FromVer: cur.Version,
 			})
 			return
 		}
-		p.stagePending(cur.Version+1, p.over)
+		p.beginTxLocked(p.over)
 		snap, cerr := p.store.CAS(ctx, cur.Version, res.Doc, store.Change{
 			Reason:   "hot-reload:" + ev.Source.Name(),
 			Actor:    "system",
 			Origin:   res.PropertyOrigin,
 			Features: res.FeatureOrigin,
 		})
-		p.clearPending(cur.Version + 1)
 		if cerr == nil {
-			// Override history committed inside the durability hook.
+			p.commitTxLocked(snap.Version)
 			_, _ = p.aud.Record(ctx, audit.Entry{
 				Actor: "system", Action: "source:reload", Target: ev.Source.Name(),
 				Result:  audit.ResultAllowed,
@@ -387,6 +443,7 @@ func (p *Plane) applySourceEvent(ctx context.Context, ev source.UpdateEvent) {
 			})
 			return
 		}
+		p.abortTxLocked()
 		if !errIs(cerr, errKindStale) {
 			_, _ = p.aud.Record(ctx, audit.Entry{
 				Actor: "system", Action: "source:reload", Target: ev.Source.Name(),
@@ -395,22 +452,26 @@ func (p *Plane) applySourceEvent(ctx context.Context, ev source.UpdateEvent) {
 			})
 			return
 		}
-		if attempt > 8 {
+		// Another serialized transition landed first: remerge from the newest
+		// snapshot and retry with the same source layer. Bounded so a persist
+		// storm cannot wedge the reload goroutine forever.
+		if attempt > 16 {
 			return
 		}
 	}
 }
 
-// remerge rebuilds the effective document from sources + override layer.
-func (p *Plane) remerge() (*merge.Result, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.remergeLocked()
+// remergeLocked rebuilds the effective document from the current source
+// layers plus the live override layer. Callers must hold mu.
+func (p *Plane) remergeLocked() (*merge.Result, error) {
+	return p.remergeWithLocked(p.over)
 }
 
-func (p *Plane) remergeLocked() (*merge.Result, error) {
+// remergeWithLocked is remergeLocked against an explicit override state, used
+// by in-flight API transactions without touching the live layer.
+func (p *Plane) remergeWithLocked(over overrideState) (*merge.Result, error) {
 	ordered := make([]merge.Layered, 0, len(p.sources)+1)
-	overDoc := p.over.emptyDoc()
+	overDoc := over.emptyDoc()
 	if len(overDoc.Properties) > 0 || len(overDoc.Features) > 0 {
 		ordered = append(ordered, merge.Layered{Name: "api-override", Version: 0, Doc: overDoc})
 	}
@@ -425,13 +486,13 @@ func (p *Plane) remergeLocked() (*merge.Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	for k := range p.over.deadProps {
+	for k := range over.deadProps {
 		if _, ok := res.Doc.Properties[k]; ok {
 			delete(res.Doc.Properties, k)
 			res.PropertyOrigin[k] = "api-override(deleted)"
 		}
 	}
-	for k := range p.over.deadFeats {
+	for k := range over.deadFeats {
 		if _, ok := res.Doc.Features[k]; ok {
 			delete(res.Doc.Features, k)
 			res.FeatureOrigin[k] = "api-override(deleted)"
