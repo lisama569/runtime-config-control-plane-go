@@ -87,6 +87,25 @@ PERSIST_SCHEMA / PERSIST_IO`（500，提交整体中止、不改变状态）与
 
 详见 [docs/DESIGN.md §7](docs/DESIGN.md)。
 
+## 并发写入与热加载
+
+API 写入、回滚和配置文件热加载都走**同一把平面级串行锁保护的一个读-改-写
+临界区**（锁序固定，读路径仍是无锁原子快照）。这带来以下保证：
+
+- **同版本并发写恰好一个生效**：多个请求带着相同 `expected_version` 同时提交时，
+  先进入临界区的成功，其余在改动任何状态前就得到 `409 STALE_VERSION`，输方的值
+  不会混进赢方结果。
+- **写与热加载不互相穿插**：任意时刻读到的都是完整一致的一份配置；文件热加载
+  与接口写入冲突时统一按版本冲突处理，不静默覆盖；源文件的“版本号 + 文档”在
+  临界区内成对读取，不会错配；从未生效的文件值不会泄漏进后续合并。
+- **成功提交不会被后来的失败请求带崩**：失败/冲突只操作局部候选，生效配置不会
+  悄悄退回旧值；版本号严格线性递增，不回退、不重复、不复用；可回滚历史快照与
+  当时真正生效的配置一一对应（store 快照历史与 override 历史同窗口同步裁剪）。
+- **对外 / 落盘 / 重启三份一致**：每次成功提交后，接口看到的生效配置、
+  `state.json` 内容、重启恢复结果是同一份（持久化先于可见性）。
+
+完整语义与失败边界见 [docs/DESIGN.md §2.1、§4](docs/DESIGN.md)。
+
 ## 配置文件格式
 
 ```json
@@ -111,8 +130,15 @@ PERSIST_SCHEMA / PERSIST_IO`（500，提交整体中止、不改变状态）与
 go vet ./...
 gofmt -l .
 go test -race -count=1 ./...        # 并发/回退/冲突/越权/边界/持久化恢复全覆盖
-go test -race -count=5 ./internal/source/ ./internal/controlplane/ ./internal/store/ ./internal/persist/
+
+# 并发一致性用例多跑几轮压时序（同版本并发写、写与热加载同时发生、真实 watcher）
+go test -race -count=10 ./internal/controlplane/ \
+  -run 'TestSameVersionConcurrentWritesExactlyOneWins|TestConcurrentWritesAndHotReloadNeverInterleave|TestFailedWriteNeverRollsBackCommittedState|TestRealWatcherConcurrentWithWrites'
 ```
+
+这些并发用例断言：每次成功提交后**对外结果、持久化内容、重启恢复结果三者一致**，
+版本严格线性，失败请求在 live 配置 / 保留历史 / 磁盘 / 重启结果里都不留痕迹，且
+在 `-race` 下无告警。
 
 手工验证“重启接着用 / 损坏回退”：
 

@@ -36,11 +36,24 @@ type PatchRequest struct {
 type jsonRaw = rawMessage
 
 // ApplyPatch validates and commits an authorized write.
-// Concurrency rule: the commit succeeds only if the live version still equals
-// ExpectedVersion; otherwise a STALE_VERSION error is returned explicitly and
-// NOTHING changes. Validation failures are all-or-nothing: no key from the
-// request is applied if any key is invalid.
+//
+// The entire read-modify-write is one critical section serialized by p.mu:
+// the live version is read, the candidate override built as a LOCAL value,
+// validated, made durable and published without ever unlocking. Consequently:
+//
+//   - the commit succeeds only if the live version still equals
+//     ExpectedVersion. Two requests carrying the same version are ordered: the
+//     first wins, the second observes the advanced version and is rejected as
+//     STALE_VERSION before touching any state, so the loser's keys can never
+//     leak into the winner's snapshot, the durable file or a restart;
+//   - validation is all-or-nothing: no key is applied if any key is invalid;
+//   - a durability failure aborts before visibility: version, live config,
+//     override layer and history all stay at the pre-commit state and the
+//     client may safely retry the same expected version.
 func (p *Plane) ApplyPatch(ctx context.Context, actor string, req PatchRequest) (from, to int64, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	cur := p.store.Current()
 	from = cur.Version
 	if req.ExpectedVersion != cur.Version {
@@ -53,55 +66,59 @@ func (p *Plane) ApplyPatch(ctx context.Context, actor string, req PatchRequest) 
 		return from, 0, staleErr(cur.Version, req.ExpectedVersion)
 	}
 
-	p.mu.Lock()
+	// Build the candidate purely as local state. The live override p.over is
+	// not assigned until the commit below succeeds, so a failed attempt cannot
+	// leave partial state behind.
 	next := p.over.clone()
-	// Build candidate effective document from current snapshot, then apply ops.
 	cand := cloneDoc(cur.Doc)
-	if err := applyPropertyOps(cand, next, req.Properties); err != nil {
-		p.mu.Unlock()
+	if vErr := applyPropertyOps(cand, next, req.Properties); vErr != nil {
 		_, _ = p.aud.Record(ctx, audit.Entry{
 			Actor: actor, Action: string(actWrite), Target: "config",
-			Result: audit.ResultError, Reason: err.Error(),
-			ErrKind: errKindString(err), FromVer: cur.Version,
+			Result: audit.ResultError, Reason: vErr.Error(),
+			ErrKind: errKindString(vErr), FromVer: cur.Version,
 		})
-		return from, 0, err
+		return from, 0, vErr
 	}
-	if err := applyFeatureOps(cand, next, req.Features); err != nil {
-		p.mu.Unlock()
+	if vErr := applyFeatureOps(cand, next, req.Features); vErr != nil {
 		_, _ = p.aud.Record(ctx, audit.Entry{
 			Actor: actor, Action: string(actWrite), Target: "config",
-			Result: audit.ResultError, Reason: err.Error(),
-			ErrKind: errKindString(err), FromVer: cur.Version,
+			Result: audit.ResultError, Reason: vErr.Error(),
+			ErrKind: errKindString(vErr), FromVer: cur.Version,
 		})
-		return from, 0, err
+		return from, 0, vErr
 	}
-	p.over = next
-	p.mu.Unlock()
 
-	// Verify against a freshly remerged document so source-derived entries and
-	// tombstones are represented exactly.
-	res, err := p.remerge()
-	if err != nil {
-		return from, 0, err
+	// Recompute the effective document from the candidate override and current
+	// sources so file-derived entries and tombstones are represented exactly;
+	// cand was only used as the validation workspace.
+	res, mErr := p.remergeOverrideLocked(next)
+	if mErr != nil {
+		_, _ = p.aud.Record(ctx, audit.Entry{
+			Actor: actor, Action: string(actWrite), Target: "config",
+			Result: audit.ResultError, Reason: mErr.Error(),
+			ErrKind: errKindString(mErr), FromVer: cur.Version,
+		})
+		return from, 0, mErr
 	}
-	// Stage the override state for the version we are about to publish so the
-	// durability hook (run inside the store's commit) can persist it before
-	// the new snapshot becomes visible.
+
 	newVersion := cur.Version + 1
-	p.stagePending(newVersion, next)
+	p.pendingOver[newVersion] = next
+	// Advance the live override before the store commits, still holding p.mu:
+	// the durability hook (invoked inside CAS) then persists exactly the
+	// override backing the snapshot about to be published, and no reader can
+	// observe either until the atomic pointer store. If CAS aborts (a
+	// durability error; version mismatch is impossible while serialized), the
+	// override is restored to the one backing the unchanged current snapshot.
+	p.over = next
 	snap, cerr := p.store.CAS(ctx, cur.Version, res.Doc, store.Change{
 		Reason: "api-patch", Actor: actor,
 		Origin: res.PropertyOrigin, Features: res.FeatureOrigin,
 	})
-	p.clearPending(newVersion)
+	delete(p.pendingOver, newVersion)
 	if cerr != nil {
-		// Lost the race (or durability failed): revert in-memory override and
-		// demand client retry. Nothing was published or made durable.
-		p.mu.Lock()
 		if prev, ok := p.overHist[cur.Version]; ok {
 			p.over = prev
 		}
-		p.mu.Unlock()
 		_, _ = p.aud.Record(ctx, audit.Entry{
 			Actor: actor, Action: string(actWrite), Target: "config",
 			Result: audit.ResultDenied, Reason: cerr.Error(),
@@ -109,8 +126,10 @@ func (p *Plane) ApplyPatch(ctx context.Context, actor string, req PatchRequest) 
 		})
 		return from, 0, cerr
 	}
-	// Override history for snap.Version was already committed inside the
-	// store's durability hook (atomically with persistence).
+
+	// The hook committed next into overHist atomically with the durability
+	// write, and p.over already equals it: served config and durable state are
+	// identical.
 	_, _ = p.aud.Record(ctx, audit.Entry{
 		Actor: actor, Action: string(actWrite), Target: "config",
 		Result:  audit.ResultAllowed,
@@ -121,10 +140,15 @@ func (p *Plane) ApplyPatch(ctx context.Context, actor string, req PatchRequest) 
 }
 
 // Rollback restores the COMPLETE effective configuration recorded at
-// targetVersion and publishes it under a brand-new version. The API override
-// state associated with that version is restored as well, so the resulting
-// effective config is identical to the target's and remains explainable.
+// targetVersion and publishes it under a brand-new linear version. The API
+// override state associated with the target is restored as well, so the new
+// effective config is identical to the target's and stays explainable. The
+// whole transition runs serialized under p.mu like ApplyPatch; a failure
+// leaves the live snapshot and override layer untouched.
 func (p *Plane) Rollback(ctx context.Context, actor string, targetVersion int64) (from, to int64, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	cur := p.store.Current()
 	from = cur.Version
 	if _, ok := p.store.AtVersion(targetVersion); !ok {
@@ -136,29 +160,29 @@ func (p *Plane) Rollback(ctx context.Context, actor string, targetVersion int64)
 		})
 		return from, 0, rollbackErr(targetVersion)
 	}
-	p.mu.Lock()
 	ov, known := p.overHist[targetVersion]
-	// Remember the current override so a failed/durability-aborted rollback
-	// restores in-memory state to match the unchanged live snapshot.
-	curOv, curKnown := p.overHist[cur.Version]
-	if known {
-		p.over = ov.clone()
-	} else {
-		// Should not happen while history bounds agree; fail closed if it does.
-		p.mu.Unlock()
+	if !known {
+		// Fail closed if the override window disagrees with the store window.
+		_, _ = p.aud.Record(ctx, audit.Entry{
+			Actor: actor, Action: string(actRollback), Target: itoa(targetVersion),
+			Result:  audit.ResultError,
+			Reason:  "target override state not retained",
+			ErrKind: "ROLLBACK_FAILED", FromVer: cur.Version,
+		})
 		return from, 0, rollbackStateErr(targetVersion)
 	}
-	p.mu.Unlock()
 
 	newVersion := cur.Version + 1
-	p.stagePending(newVersion, ov)
+	candidate := ov.clone()
+	p.pendingOver[newVersion] = candidate
+	p.over = candidate
 	snap, cerr := p.store.Rollback(ctx, targetVersion, actor)
-	p.clearPending(newVersion)
+	delete(p.pendingOver, newVersion)
 	if cerr != nil {
-		if curKnown {
-			p.mu.Lock()
-			p.over = curOv.clone()
-			p.mu.Unlock()
+		// Durability abort: nothing was published; restore the override backing
+		// the unchanged current snapshot, all under the lock.
+		if curOv, ok := p.overHist[cur.Version]; ok {
+			p.over = curOv
 		}
 		_, _ = p.aud.Record(ctx, audit.Entry{
 			Actor: actor, Action: string(actRollback), Target: itoa(targetVersion),
@@ -167,7 +191,8 @@ func (p *Plane) Rollback(ctx context.Context, actor string, targetVersion int64)
 		})
 		return from, 0, cerr
 	}
-	// Override history for the new version was committed in the hook.
+	// The hook committed the candidate into overHist under the same lock and
+	// p.over already equals it.
 	_, _ = p.aud.Record(ctx, audit.Entry{
 		Actor: actor, Action: string(actRollback), Target: itoa(targetVersion),
 		Result:  audit.ResultAllowed,

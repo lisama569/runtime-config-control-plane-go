@@ -49,20 +49,14 @@ func fromPersistOverride(o persist.Override) overrideState {
 	return ov
 }
 
-// persistHook builds the store.BeforeCommit durability hook. It runs inside
-// the store's serialized commit; the pending override state for the new
-// version is staged before the store call and read under p.mu here
-// (store.mu -> p.mu is the single, consistent lock order).
+// persistHook builds the store.BeforeCommit durability hook. The store invokes
+// the hook inside CAS/Rollback while holding its own mutex; every control-plane
+// transition calls those with p.mu already held, so the single, consistent
+// lock order is p.mu -> store.mu and the hook must NOT re-acquire p.mu.
 func (p *Plane) persistHook() store.BeforeCommit {
 	return func(ctx context.Context, snap *config.Snapshot, history []*config.Snapshot) error {
-		p.mu.Lock()
-		_, ok := p.pendingOver[snap.Version]
-		p.mu.Unlock()
-		if !ok {
-			// Programmer error, not a user failure: refuse to publish a commit
-			// we cannot make durable.
-			return persistStateErr(snap.Version)
-		}
+		// saveDurable verifies the staging slot, writes state, and commits the
+		// override-history entry atomically (all under the held p.mu).
 		return p.saveDurable(ctx, snap, history)
 	}
 }

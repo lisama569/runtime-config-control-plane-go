@@ -18,16 +18,26 @@ import (
 
 func persistentPlane(t *testing.T, pdir string) (*Plane, string) {
 	t.Helper()
-	sdir := t.TempDir()
-	path := filepath.Join(sdir, "base.json")
-	writeCfg(t, path, baseV1())
+	return persistentPlaneWithSource(t, pdir, "")
+}
+
+// persistentPlaneWithSource builds (or restarts into pdir) a persistent plane.
+// When srcPath is empty a fresh temp source file is created (first start); a
+// non-empty path reopens that SAME source file, modeling a real restart where
+// the on-disk configuration files persist across the process boundary.
+func persistentPlaneWithSource(t *testing.T, pdir, srcPath string) (*Plane, string) {
+	t.Helper()
+	if srcPath == "" {
+		srcPath = filepath.Join(t.TempDir(), "base.json")
+		writeCfg(t, srcPath, baseV1())
+	}
 	tokens := map[string]auth.Principal{
 		tokReader: {Name: "reader-1", Role: auth.RoleReader},
 		tokWriter: {Name: "writer-1", Role: auth.RoleWriter},
 		tokAdmin:  {Name: "admin-1", Role: auth.RoleAdmin},
 	}
 	plane, err := New(context.Background(), Options{
-		Sources:       []source.Source{source.NewFileSource("base", 1, path)},
+		Sources:       []source.Source{source.NewFileSource("base", 1, srcPath)},
 		Tokens:        tokens,
 		PollInterval:  time.Hour, // disable watcher interference
 		PersistDir:    pdir,
@@ -37,7 +47,7 @@ func persistentPlane(t *testing.T, pdir string) (*Plane, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = plane.Close() })
-	return plane, path
+	return plane, srcPath
 }
 
 type nopLog struct{}

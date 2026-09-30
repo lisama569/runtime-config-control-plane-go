@@ -6,8 +6,6 @@ import (
 
 func errValidation(msg string) error { return errs.New(errs.KindValidation, msg) }
 
-func errIs(err error, kind errs.Kind) bool { return errs.Of(err, kind) }
-
 func errKindString(err error) string { return string(errs.Classify(err)) }
 
 // itoa small local helper to avoid importing strconv everywhere.
@@ -32,5 +30,3 @@ func itoa(n int64) string {
 	}
 	return string(b[i:])
 }
-
-const errKindStale = errs.KindStaleVersion
